@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Phone Sensor Exercise Counter (alpha/beta/gamma)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Roboto, Arial; padding:16px; background:#f7f8fb; color:#111; }
+    .card { background:#fff; border-radius:12px; padding:14px; box-shadow:0 6px 18px rgba(0,0,0,0.08); margin-bottom:12px; }
+    h1 { font-size:1.1rem; margin:0 0 8px 0; }
+    label { font-size:.9rem; display:block; margin-top:8px; color:#444; }
+    input, select, button { font-size:1rem; padding:10px; margin-top:6px; width:100%; box-sizing:border-box; border-radius:8px; border:1px solid #e2e8f0; }
+    .row { display:flex; gap:8px; }
+    .row > * { flex:1; }
+    .big { font-size:1.6rem; font-weight:700; text-align:center; padding:12px 0; }
+    .small { font-size:.85rem; color:#666; }
+    .status { text-align:center; margin-top:8px; }
+    .controls { display:flex; gap:8px; margin-top:8px; }
+    .controls button { flex:1; }
+    footer { margin-top:12px; font-size:.8rem; color:#666; text-align:center; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Exercise Rep Counter (phone as sensor)</h1>
+    <div class="small">Uses device orientation (alpha, beta, gamma) & motion. Hold phone in hand and perform exercise. Calibrate first.</div>
+  </div>
+
+  <div class="card" id="settings">
+    <label>Weight (kg)</label>
+    <input type="number" id="weight" value="70" min="20" />
+
+    <label>Exercise / MET</label>
+    <select id="exercise">
+      <option value="5">Squats — MET 5</option>
+      <option value="8">Push-ups — MET 8</option>
+      <option value="8">Jumping Jacks — MET 8</option>
+      <option value="3">Walking (in place) — MET 3</option>
+      <option value="4">Yoga / Stretch — MET 4</option>
+      <option value="6">Arm Curls — MET 6</option>
+    </select>
+
+    <label>Use which orientation angle for counting?</label>
+    <select id="angleAxis">
+      <option value="beta">Beta (tilt front/back) — Good for curls/squats</option>
+      <option value="gamma">Gamma (tilt left/right)</option>
+      <option value="alpha">Alpha (rotation around z axis)</option>
+    </select>
+
+    <label>Up Threshold (degrees)</label>
+    <input type="number" id="upThreshold" value="18" min="3" />
+
+    <label>Down Threshold (degrees)</label>
+    <input type="number" id="downThreshold" value="6" min="1" />
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="requestPerm">Request Motion Permission</button>
+      <button id="calibrate">Calibrate Rest Angle</button>
+    </div>
+
+    <div class="row controls">
+      <button id="startBtn">Start</button>
+      <button id="stopBtn" disabled>Stop</button>
+    </div>
+
+    <div class="big" id="countDisplay">Reps: 0</div>
+    <div class="small status" id="liveAngles">alpha: — | beta: — | gamma: —</div>
+    <div class="small status" id="timeAndCalories">Time: 00:00 | Calories: 0.00 kcal</div>
+  </div>
+
+  <div class="card small">
+    <div><strong>How it works</strong></div>
+    <ul>
+      <li>Calibrate to set the rest angle while holding phone naturally.</li>
+      <li>Start exercise — the code watches the chosen orientation (alpha/beta/gamma).</li>
+      <li>When angle rises above <em>rest + upThreshold</em> (state → up) and then drops below <em>rest + downThreshold</em> (state → down), it's counted as 1 rep.</li>
+    </ul>
+  </div>
+
+  <footer>Tip: Hold phone firmly in hand. For best results, use <em>beta</em> for front/back motions (curls, squats).</footer>
+
+<script>
+/*
+  Exercise rep counter using DeviceOrientation angles (alpha, beta, gamma).
+  - Calibrate restAngle
+  - Simple state-machine peak detection: down -> up -> back to down -> increment rep
+  - Low-pass smoothing applied to angle readings
+  - Calories: MET * weight (kg) * duration_hours
+*/
+
+let restAngle = null;
+let angleAxis = 'beta'; // 'alpha','beta','gamma'
+let upThreshold = 18;
+let downThreshold = 6;
+let weightKg = 70;
+let MET = 6;
+let smoothing = 0.15; // low-pass alpha
+let filteredAngle = null;
+let state = 'down'; // 'down' or 'up'
+let reps = 0;
+let listening = false;
+let startTime = null;
+let elapsedMs = 0;
+let timerInterval = null;
+
+const countDisplay = document.getElementById('countDisplay');
+const liveAngles = document.getElementById('liveAngles');
+const timeAndCalories = document.getElementById('timeAndCalories');
+
+function updateSettingsFromUI(){
+  angleAxis = document.getElementById('angleAxis').value;
+  upThreshold = Number(document.getElementById('upThreshold').value);
+  downThreshold = Number(document.getElementById('downThreshold').value);
+  weightKg = Number(document.getElementById('weight').value) || 70;
+  MET = Number(document.getElementById('exercise').value) || 6;
+}
+
+document.getElementById('angleAxis').addEventListener('change', updateSettingsFromUI);
+document.getElementById('upThreshold').addEventListener('change', updateSettingsFromUI);
+document.getElementById('downThreshold').addEventListener('change', updateSettingsFromUI);
+document.getElementById('weight').addEventListener('change', updateSettingsFromUI);
+document.getElementById('exercise').addEventListener('change', updateSettingsFromUI);
+
+async function requestMotionPermission(){
+  // iOS requires explicit permission
+  if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+    try {
+      const res = await DeviceMotionEvent.requestPermission();
+      if (res !== 'granted') {
+        alert('Permission denied for motion sensors.');
+        return;
+      }
+    } catch (e) {
+      console.warn('DeviceMotion permission error:', e);
+    }
+  }
+  if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+    try {
+      const res = await DeviceOrientationEvent.requestPermission();
+      if (res !== 'granted') {
+        alert('Permission denied for orientation sensors.');
+        return;
+      }
+    } catch (e) {
+      console.warn('DeviceOrientation permission error:', e);
+    }
+  }
+  alert('Sensor permission (if required) granted or not needed. Now calibrate and start.');
+}
+
+document.getElementById('requestPerm').addEventListener('click', () => {
+  requestMotionPermission();
+});
+
+// Calibrate: sample current angle as restAngle
+document.getElementById('calibrate').addEventListener('click', () => {
+  if (filteredAngle === null) {
+    alert('Move phone gently and press Calibrate while holding the resting position.');
+    return;
+  }
+  restAngle = filteredAngle;
+  alert('Calibrated rest angle: ' + restAngle.toFixed(1) + '° on ' + angleAxis);
+});
+
+// Start & Stop
+document.getElementById('startBtn').addEventListener('click', () => {
+  updateSettingsFromUI();
+  if (restAngle === null) {
+    // If user didn't calibrate, set current filtered reading as rest after a short prompt
+    if (filteredAngle !== null) {
+      restAngle = filteredAngle;
+      console.log('Auto-calibrated restAngle to', restAngle);
+    } else {
+      alert('Please calibrate (or allow sensors) first.');
+      return;
+    }
+  }
+  reps = 0;
+  state = 'down';
+  listening = true;
+  startTime = Date.now();
+  elapsedMs = 0;
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('stopBtn').disabled = false;
+  countDisplay.textContent = 'Reps: 0';
+  timerInterval = setInterval(updateTimeAndCalories, 500);
+});
+
+document.getElementById('stopBtn').addEventListener('click', () => {
+  listening = false;
+  document.getElementById('startBtn').disabled = false;
+  document.getElementById('stopBtn').disabled = true;
+  clearInterval(timerInterval);
+  updateTimeAndCalories(); // final update
+});
+
+// Smooth angle with simple low-pass filter
+function smoothAngle(inAngle){
+  if (filteredAngle === null) filteredAngle = inAngle;
+  // handle wrapping for alpha around 0/360: convert to continuous domain
+  if (angleAxis === 'alpha') {
+    // we keep alpha in -180..180 to avoid wrap jumps
+    let diff = inAngle - filteredAngle;
+    if (diff > 180) diff -= 360;
+    if (diff < -180) diff += 360;
+    filteredAngle = filteredAngle + smoothing * diff;
+    // normalize
+    if (filteredAngle > 180) filteredAngle -= 360;
+    if (filteredAngle < -180) filteredAngle += 360;
+  } else {
+    // beta and gamma are already -180..180 generally
+    filteredAngle = filteredAngle + smoothing * (inAngle - filteredAngle);
+  }
+  return filteredAngle;
+}
+
+function normalizeAngle(a){
+  // ensure value is in -180..180
+  if (a > 180) return a - 360;
+  if (a < -180) return a + 360;
+  return a;
+}
+
+function handleOrientation(e){
+  // e.alpha, e.beta, e.gamma may be null on some browsers
+  let a = (e.alpha !== null && e.alpha !== undefined) ? normalizeAngle(e.alpha) : null;
+  let b = (e.beta  !== null && e.beta  !== undefined) ? normalizeAngle(e.beta)  : null;
+  let g = (e.gamma !== null && e.gamma !== undefined) ? normalizeAngle(e.gamma) : null;
+
+  // choose axis
+  let rawAngle = 0;
+  if (angleAxis === 'alpha') rawAngle = a ?? 0;
+  if (angleAxis === 'beta')  rawAngle = b ?? 0;
+  if (angleAxis === 'gamma') rawAngle = g ?? 0;
+
+  let s = smoothAngle(rawAngle);
+  liveAngles.textContent = `alpha: ${a===null? '—' : a.toFixed(1)} | beta: ${b===null? '—' : b.toFixed(1)} | gamma: ${g===null? '—' : g.toFixed(1)}`;
+
+  if (!listening) return;
+
+  // counting logic: simple state machine with thresholds relative to restAngle
+  // For some exercises restAngle may be near 0, or non-zero depending on how user holds phone.
+  let upTrigger = restAngle + upThreshold;
+  let downTrigger = restAngle + downThreshold;
+
+  // Special handling if restAngle is negative vs positive — thresholds are relative, works in general.
+  // If alpha axis used, we already smoothed for wrap.
+
+  // State transitions:
+  // If currently 'down' and angle exceeds upTrigger -> state becomes 'up'
+  if (state === 'down' && s > upTrigger) {
+    state = 'up';
+    // optional: visual cue
+  }
+  // If currently 'up' and angle falls below downTrigger -> count rep, go to 'down'
+  else if (state === 'up' && s < downTrigger) {
+    state = 'down';
+    reps += 1;
+    countDisplay.textContent = 'Reps: ' + reps;
+  }
+}
+
+// time & calories update
+function updateTimeAndCalories(){
+  if (!startTime) return;
+  elapsedMs = Date.now() - startTime;
+  const elapsedMin = elapsedMs / 60000.0;
+  // calories = MET * weight(kg) * hours
+  const elapsedHours = elapsedMs / 3600000.0;
+  const calories = MET * weightKg * elapsedHours;
+  const mins = Math.floor(elapsedMin);
+  const secs = Math.floor((elapsedMin - mins) * 60);
+  timeAndCalories.textContent = `Time: ${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')} | Calories: ${calories.toFixed(2)} kcal`;
+}
+
+// attach event listeners
+if (window.DeviceOrientationEvent) {
+  window.addEventListener('deviceorientation', handleOrientation, true);
+} else {
+  alert('DeviceOrientation not supported on this device/browser.');
+}
+
+// Also attempt to read DeviceMotion for potential advanced features (not used directly here)
+window.addEventListener('devicemotion', (e) => {
+  // optional extension: could use e.accelerationIncludingGravity for step detection
+  // console.log(e.acceleration, e.rotationRate);
+}, true);
+
+// Good practice: stop listening when page hidden to save battery
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && listening) {
+    // pause timer but keep current state (or stop listening)
+    // For simplicity, we'll stop counting
+    document.getElementById('stopBtn').click();
+  }
+});
+</script>
+</body>
+</html>
